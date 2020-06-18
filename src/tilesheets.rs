@@ -1,4 +1,4 @@
-use crate::{decode_srgb, encode_srgb, fix_translucent, resize, save, FloatImage};
+use crate::{decode_srgb, encode_srgb, fix_translucent, resize, FloatImage};
 use image::{self, ImageBuffer, RgbaImage};
 use mediawiki::{tilesheet::Tilesheet, Mediawiki};
 use regex::Regex;
@@ -8,7 +8,6 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     io::{stdin, BufRead, BufReader, BufWriter, Read, Write},
-    mem::swap,
     path::Path,
     process::{exit, Command},
 };
@@ -16,60 +15,74 @@ use walkdir::WalkDir;
 
 struct Sheet {
     size: u32,
-    img: RgbaImage,
+    layers: Vec<RgbaImage>,
 }
 impl Sheet {
     fn new(size: u32) -> Sheet {
-        let img = ImageBuffer::new(size, size);
-        Sheet { size, img }
-    }
-    fn load(data: &[u8], size: u32) -> Sheet {
-        let img = image::load_from_memory(data).unwrap();
         Sheet {
             size,
-            img: img.to_rgba(),
+            layers: Vec::new(),
         }
     }
-    fn grow(&mut self, w: u32, h: u32) {
-        let mut img = ImageBuffer::new(w, h);
-        for (x, y, &pix) in self.img.enumerate_pixels() {
-            img.put_pixel(x, y, pix);
-        }
-        swap(&mut self.img, &mut img);
+    fn load_layer(&mut self, data: &[u8]) {
+        let layer = image::load_from_memory(data).unwrap();
+        self.layers.push(layer.to_rgba());
     }
-    fn insert(&mut self, x: u32, y: u32, img: &FloatImage) {
+    fn add_layer(&mut self) {
+        let layer = ImageBuffer::new(self.size, self.size);
+        self.layers.push(layer);
+    }
+    fn grow(&mut self, w: u32, h: u32, z: u32) {
+        let mut new_layer = ImageBuffer::new(w, h);
+        let old_layer = &mut self.layers[z as usize];
+        for (x, y, &pix) in old_layer.enumerate_pixels() {
+            new_layer.put_pixel(x, y, pix);
+        }
+        *old_layer = new_layer;
+    }
+    fn insert(&mut self, TilePos { x, y, z }: TilePos, img: &FloatImage) {
         let (width, height) = img.dimensions();
         assert!(width == height);
         let img = resize(img, self.size, self.size);
         let img = encode_srgb(&img);
-        let (w, h) = self.img.dimensions();
-        if (x + 1) * self.size > w || (y + 1) * self.size > h {
+        if z as usize == self.layers.len() {
+            self.add_layer();
+        }
+        let (w, h) = self.layers[z as usize].dimensions();
+        let (nw, nh) = ((x + 1) * self.size, (y + 1) * self.size);
+        if nw > w || nh > h {
             let (nw, nh) = (max((x + 1) * self.size, w), max((y + 1) * self.size, h));
-            self.grow(nw, nh)
+            self.grow(max(w, nw), max(h, nh), z)
         }
         let (x, y) = (x * self.size, y * self.size);
+        let layer = &mut self.layers[z as usize];
         for (xx, yy, &pix) in img.enumerate_pixels() {
-            self.img.put_pixel(x + xx, y + yy, pix);
+            layer.put_pixel(x + xx, y + yy, pix);
         }
     }
 }
 #[derive(Debug)]
 struct Tile {
+    pos: TilePos,
+    id: Option<u64>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct TilePos {
     x: u32,
     y: u32,
-    id: Option<u64>,
+    z: u32,
 }
 struct TilesheetManager {
     mw: Mediawiki,
     name: String,
     tiles: HashMap<String, Tile>,
-    entries: HashMap<(u32, u32), String>,
+    entries: HashMap<TilePos, String>,
     renames: HashMap<String, String>,
     added: Vec<String>,
     missing: HashSet<String>,
     deleted: Vec<u64>,
     tilesheets: Vec<Sheet>,
-    next: (u32, u32),
+    next: (u32, u32, u32),
 }
 impl TilesheetManager {
     fn new(name: &str) -> TilesheetManager {
@@ -84,7 +97,7 @@ impl TilesheetManager {
             missing: HashSet::new(),
             deleted: Vec::new(),
             tilesheets: Vec::new(),
-            next: (0, 0),
+            next: (0, 0, 0),
         }
     }
     fn import_tilesheets(&mut self) {
@@ -106,16 +119,22 @@ impl TilesheetManager {
             println!("Existing tilesheet sizes: {:?}", sizes);
             println!("Importing existing tilesheet images.");
             for size in sizes {
-                if let Some(data) = self
-                    .mw
-                    .download_file(&format!("Tilesheet {} {}.png", self.name, size))
-                    .unwrap()
-                {
-                    self.tilesheets.push(Sheet::load(&data, size as u32))
-                } else {
-                    println!("WARNING: No tilesheet image found for size {}!", size);
-                    self.tilesheets.push(Sheet::new(size as u32));
+                let mut sheet = Sheet::new(size as u32);
+                for z in 0.. {
+                    if let Some(data) = self
+                        .mw
+                        .download_file(&format!("Tilesheet {} {} {}.png", self.name, size, z))
+                        .unwrap()
+                    {
+                        sheet.load_layer(&data);
+                    } else {
+                        if z == 0 {
+                            println!("WARNING: No tilesheet image found for size {}!", size);
+                        }
+                        break;
+                    }
                 }
+                self.tilesheets.push(sheet);
             }
         } else {
             println!("No tilesheet found. Please specify desired sizes separated by commas:");
@@ -143,11 +162,13 @@ impl TilesheetManager {
             };
             let x = tile["x"].as_u64().unwrap() as u32;
             let y = tile["y"].as_u64().unwrap() as u32;
+            let z = tile["z"].as_u64().unwrap() as u32;
             let id = tile["id"].as_u64().unwrap();
             let name = tile["name"].as_str().unwrap();
+            let pos = TilePos { x, y, z };
             self.tiles
-                .insert(name.to_owned(), Tile { x, y, id: Some(id) });
-            self.entries.insert((x, y), name.to_owned());
+                .insert(name.to_owned(), Tile { pos, id: Some(id) });
+            self.entries.insert(pos, name.to_owned());
             self.missing.insert(name.to_owned());
         }
     }
@@ -213,7 +234,7 @@ impl TilesheetManager {
             let name = line.unwrap();
             if let Some(tile) = self.tiles.remove(&name) {
                 self.deleted.push(tile.id.unwrap());
-                self.entries.remove(&(tile.x, tile.y));
+                self.entries.remove(&tile.pos);
             } else {
                 println!(
                     "ERROR: Requested to delete tile that doesn't exist {:?}",
@@ -222,15 +243,23 @@ impl TilesheetManager {
             }
         }
     }
-    fn lookup(&mut self, name: &str) -> (u32, u32) {
+    fn lookup(&mut self, name: &str) -> TilePos {
         if let Some(tile) = self.tiles.get(name) {
-            return (tile.x, tile.y);
+            return tile.pos;
         }
         let pos = loop {
             let pos = if self.next.1 < self.next.0 {
-                (self.next.1, self.next.0)
+                TilePos {
+                    x: self.next.1,
+                    y: self.next.0,
+                    z: self.next.2,
+                }
             } else {
-                (self.next.0, self.next.1 - self.next.0)
+                TilePos {
+                    x: self.next.0,
+                    y: self.next.1 - self.next.0,
+                    z: self.next.2,
+                }
             };
             if self.entries.get(&pos).is_none() {
                 break pos;
@@ -239,18 +268,15 @@ impl TilesheetManager {
             if self.next.1 > self.next.0 * 2 {
                 self.next.0 += 1;
                 self.next.1 = 0;
+                if self.next.0 == 64 {
+                    self.next.0 = 0;
+                    self.next.2 += 1;
+                }
             }
         };
-        self.tiles.insert(
-            name.to_owned(),
-            Tile {
-                x: pos.0,
-                y: pos.1,
-                id: None,
-            },
-        );
+        self.tiles.insert(name.to_owned(), Tile { pos, id: None });
         self.entries.insert(pos, name.to_owned());
-        (pos.0, pos.1)
+        pos
     }
     fn update(&mut self) {
         println!("Updating tilesheet with new tiles.");
@@ -281,9 +307,9 @@ impl TilesheetManager {
             let mut img = image::open(&path).unwrap().to_rgba();
             fix_translucent(&mut img);
             let img = decode_srgb(&img);
-            let (x, y) = self.lookup(&name);
+            let pos = self.lookup(&name);
             for tilesheet in &mut self.tilesheets {
-                tilesheet.insert(x, y, &img);
+                tilesheet.insert(pos, &img);
             }
         }
     }
@@ -292,11 +318,13 @@ impl TilesheetManager {
         let optipng = self
             .tilesheets
             .iter()
-            .map(|tilesheet| {
-                let name = format!("Tilesheet {} {}.png", self.name, tilesheet.size);
-                let path = Path::new(r"work/tilesheets").join(name);
-                save(&tilesheet.img, &path);
-                Command::new("optipng").arg(path).spawn().unwrap()
+            .flat_map(|tilesheet| {
+                tilesheet.layers.iter().enumerate().map(move |(z, layer)| {
+                    let name = format!("Tilesheet {} {} {}.png", self.name, tilesheet.size, z);
+                    let path = Path::new(r"work/tilesheets").join(name);
+                    layer.save(&path).unwrap();
+                    Command::new("optipng").arg(path).spawn().unwrap()
+                })
             })
             .collect::<Vec<_>>();
         for mut child in optipng {
@@ -329,7 +357,7 @@ impl TilesheetManager {
                 .iter()
                 .map(|name| {
                     let tile = &self.tiles[name];
-                    format!("{} {} {}", tile.x, tile.y, name)
+                    format!("{} {} {} {}", tile.pos.x, tile.pos.y, tile.pos.z, name)
                 })
                 .collect::<Vec<_>>()
                 .join("|");
