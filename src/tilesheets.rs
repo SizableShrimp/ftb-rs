@@ -1,7 +1,3 @@
-use crate::{decode_srgb, encode_srgb, fix_translucent, resize, save, FloatImage};
-use image::{self, ImageBuffer, RgbaImage};
-use mediawiki::{tilesheet::Tilesheet, Mediawiki};
-use regex::Regex;
 use std::{
     borrow::ToOwned,
     cmp::max,
@@ -9,15 +5,22 @@ use std::{
     fs::File,
     io::{stdin, BufRead, BufReader, BufWriter, Read, Write},
     mem::swap,
-    path::Path,
+    path::{Path, PathBuf},
     process::{exit, Command},
 };
+
+use image::{self, ImageBuffer, RgbaImage};
+use mediawiki::{tilesheet::Tilesheet, Csrf, Mediawiki, Token};
+use regex::Regex;
 use walkdir::WalkDir;
+
+use crate::{decode_srgb, encode_srgb, fix_translucent, resize, save, FloatImage};
 
 struct Sheet {
     size: u32,
     img: RgbaImage,
 }
+
 impl Sheet {
     fn new(size: u32) -> Sheet {
         let img = ImageBuffer::new(size, size);
@@ -39,7 +42,7 @@ impl Sheet {
     }
     fn insert(&mut self, x: u32, y: u32, img: &FloatImage) {
         let (width, height) = img.dimensions();
-        assert!(width == height);
+        assert_eq!(width, height);
         let img = resize(img, self.size, self.size);
         let img = encode_srgb(&img);
         let (w, h) = self.img.dimensions();
@@ -53,12 +56,14 @@ impl Sheet {
         }
     }
 }
+
 #[derive(Debug)]
 struct Tile {
     x: u32,
     y: u32,
     id: Option<u64>,
 }
+
 struct TilesheetManager {
     mw: Mediawiki,
     name: String,
@@ -69,8 +74,10 @@ struct TilesheetManager {
     missing: HashSet<String>,
     deleted: Vec<u64>,
     tilesheets: Vec<Sheet>,
+    paths: Vec<PathBuf>,
     next: (u32, u32),
 }
+
 impl TilesheetManager {
     fn new(name: &str) -> TilesheetManager {
         println!("Starting up tilesheet manager.");
@@ -84,6 +91,7 @@ impl TilesheetManager {
             missing: HashSet::new(),
             deleted: Vec::new(),
             tilesheets: Vec::new(),
+            paths: Vec::new(),
             next: (0, 0),
         }
     }
@@ -287,8 +295,9 @@ impl TilesheetManager {
             }
         }
     }
-    fn optimize(&self) {
+    fn optimize(&mut self) {
         println!("Optimizing tilesheets");
+        let mut temp = Vec::new();
         let optipng = self
             .tilesheets
             .iter()
@@ -296,16 +305,116 @@ impl TilesheetManager {
                 let name = format!("Tilesheet {} {}.png", self.name, tilesheet.size);
                 let path = Path::new(r"work/tilesheets").join(name);
                 save(&tilesheet.img, &path);
+                temp.push(path.to_owned());
                 Command::new("optipng").arg(path).spawn().unwrap()
             })
             .collect::<Vec<_>>();
+        self.paths.extend(temp);
         for mut child in optipng {
             child.wait().unwrap();
         }
     }
     fn upload_sheets(&self) {
-        println!("Tilesheet uploading does not work currently.");
-        println!("Please manually upload the tilesheet images.");
+        let token = self.mw.get_token().unwrap();
+        for path in &self.paths {
+            self.upload_path(path, None, &token, false);
+        }
+    }
+    fn upload_path(
+        &self,
+        path: &PathBuf,
+        filekey: Option<String>,
+        token: &Token<Csrf>,
+        ignore_warnings: bool,
+    ) {
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        if !ignore_warnings {
+            println!("Uploading \"{}\"", filename);
+        }
+        let result;
+        let text = "[[Category:Tilesheets]]";
+        if let Some(key) = filekey {
+            result =
+                self.mw
+                    .upload_filekey(filename, key.as_str(), &token, Some(text), ignore_warnings);
+        } else {
+            result = self
+                .mw
+                .upload_file(filename, &path, &token, Some(text), ignore_warnings);
+        }
+
+        if let Ok(v) = result {
+            if v.get("errors").is_none() {
+                let value = v.get("upload").unwrap();
+                let response = value.get("result").unwrap().as_str().unwrap();
+                let filekey = &value["filekey"];
+                if response == "Warning" {
+                    let warnings = value.get("warnings").unwrap();
+                    let map = warnings.as_object().unwrap();
+                    let reupload = map
+                        .get("exists")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == filename)
+                        .unwrap_or(false);
+                    if map.len() == 1 && reupload {
+                        // Warning is about the page already existing, but we are updating it.
+                        self.upload_path(
+                            path,
+                            filekey.as_str().map(|s| s.to_string()),
+                            token,
+                            true,
+                        );
+                        return;
+                    }
+                    println!("The API returned warnings when attempting to upload the file.");
+                    println!("Warnings: {:?}", serde_json::to_string(warnings).unwrap());
+                    println!(
+                        "Would you like to try to upload the file again and ignore these warnings? y/n"
+                    );
+                    let mut input = String::new();
+                    stdin().read_line(&mut input).unwrap();
+                    input = input.trim().to_owned();
+                    if input.to_ascii_lowercase() == "y" {
+                        self.upload_path(
+                            path,
+                            filekey.as_str().map(|s| s.to_string()),
+                            token,
+                            true,
+                        );
+                    } else {
+                        println!("Please manually upload {}.", filename);
+                    }
+                } else if response == "Success" {
+                    println!("Successfully uploaded {}", filename);
+                }
+            } else {
+                println!(
+                    "An error occurred when uploading \"{}\". Please manually upload the file.",
+                    filename
+                );
+                let errors = v.get("errors").unwrap().as_array();
+                if let Some(vector) = errors {
+                    let mut count = 1;
+                    for error in vector {
+                        let code = error["code"].as_str().unwrap_or("");
+                        let description = error["*"].as_str().unwrap_or("");
+                        println!(
+                            "Error response from API ({}): {} - {}",
+                            count, code, description
+                        );
+                        count += 1;
+                    }
+                } else {
+                    println!("The API didn't return any error objects to display.");
+                }
+            }
+        } else {
+            println!(
+                "An error occurred when uploading \"{}\". Please manually upload the file.",
+                filename
+            );
+            println!("Error locally: {:?}", result);
+        }
     }
     fn delete_tiles(&self) {
         println!("Deleting old tiles that are no longer needed.");
@@ -339,6 +448,7 @@ impl TilesheetManager {
         }
     }
 }
+
 fn load_renames(name: &str) -> HashMap<String, String> {
     let path = Path::new(r"work/tilesheets").join(name);
     match File::open(&path.join("renames.txt")) {
@@ -362,6 +472,7 @@ fn load_renames(name: &str) -> HashMap<String, String> {
         }
     }
 }
+
 pub fn update_tilesheet(name: &str) {
     let mut manager = TilesheetManager::new(name);
     manager.import_tilesheets();

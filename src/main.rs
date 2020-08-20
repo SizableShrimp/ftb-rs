@@ -1,8 +1,6 @@
 #![warn(clippy::all)]
 #![allow(clippy::many_single_char_names)]
 
-use image::ColorType::RGBA;
-use image::{ImageBuffer, Rgba, RgbaImage};
 use std::{
     cmp::Ordering,
     env::args,
@@ -10,11 +8,15 @@ use std::{
     io::{stdin, Write},
     path::Path,
 };
+
+use image::ColorType::RGBA;
+use image::{ImageBuffer, Rgba, RgbaImage};
 use walkdir::WalkDir;
 
 mod tilesheets;
 
 type FloatImage = ImageBuffer<Rgba<f32>, Vec<f32>>;
+
 fn save(img: &RgbaImage, path: &Path) {
     image::save_buffer(path, img, img.width(), img.height(), RGBA(8)).unwrap();
 }
@@ -23,6 +25,7 @@ trait Srgb {
     type Linear;
     fn decode(&self) -> <Self as Srgb>::Linear;
 }
+
 impl Srgb for Rgba<u8> {
     type Linear = Rgba<f32>;
     fn decode(&self) -> Rgba<f32> {
@@ -38,6 +41,7 @@ impl Srgb for Rgba<u8> {
         Rgba([p[0] * p[3], p[1] * p[3], p[2] * p[3], p[3]])
     }
 }
+
 fn fix_translucent(img: &mut RgbaImage) {
     for p in img.pixels_mut() {
         #[inline]
@@ -57,14 +61,17 @@ fn fix_translucent(img: &mut RgbaImage) {
         p[2] = unmult(p[2], p[3]);
     }
 }
+
 fn decode_srgb(img: &RgbaImage) -> FloatImage {
     let (w, h) = img.dimensions();
     ImageBuffer::from_fn(w, h, |x, y| img[(x, y)].decode())
 }
+
 trait Linear {
     type Srgb;
     fn encode(&self) -> <Self as Linear>::Srgb;
 }
+
 impl Linear for Rgba<f32> {
     type Srgb = Rgba<u8>;
     fn encode(&self) -> Rgba<u8> {
@@ -89,10 +96,12 @@ impl Linear for Rgba<f32> {
         Rgba([enc(p[0]), enc(p[1]), enc(p[2]), enc(p[3])])
     }
 }
+
 fn encode_srgb(img: &FloatImage) -> RgbaImage {
     let (w, h) = img.dimensions();
     ImageBuffer::from_fn(w, h, |x, y| img[(x, y)].encode())
 }
+
 fn resize(img: &FloatImage, width: u32, height: u32) -> FloatImage {
     let (w, h) = img.dimensions();
     assert!(width.cmp(&w) == height.cmp(&h));
@@ -127,6 +136,7 @@ fn resize(img: &FloatImage, width: u32, height: u32) -> FloatImage {
         }
     }
 }
+
 #[allow(dead_code)]
 fn shrink() {
     let _ = create_dir("work/shrunk");
@@ -152,6 +162,7 @@ fn shrink() {
         save(&img, format!("work/shrunk/Block {}", name).as_ref());
     }
 }
+
 fn main() {
     println!("Welcome to the FTB tilesheet program!");
     if !Path::new("ftb.json").is_file() {
