@@ -76,20 +76,11 @@ impl Linear for Rgba<f32> {
     type Srgb = Rgba<u8>;
     fn encode(&self) -> Rgba<u8> {
         fn enc(x: f32) -> u8 {
-            let x = if x <= 0.0031308 {
-                x * 12.92
-            } else {
-                x.powf(1. / 2.4) * (1. + 0.055) - 0.055
-            };
+            let x = if x <= 0.0031308 { x * 12.92 } else { x.powf(1. / 2.4) * (1. + 0.055) - 0.055 };
             (x * 255.).round().max(0.).min(255.) as u8
         }
         let p = if self[3] > 0.0001 {
-            Rgba([
-                self[0] / self[3],
-                self[1] / self[3],
-                self[2] / self[3],
-                self[3],
-            ])
+            Rgba([self[0] / self[3], self[1] / self[3], self[2] / self[3], self[3]])
         } else {
             Rgba([0., 0., 0., 0.])
         };
@@ -139,8 +130,8 @@ fn resize(img: &FloatImage, width: u32, height: u32) -> FloatImage {
 
 #[allow(dead_code)]
 fn shrink() {
-    let _ = create_dir("work/shrunk");
-    for entry in WalkDir::new("work/shrink") {
+    let _ = create_dir("shrunk");
+    for entry in WalkDir::new("shrink") {
         let entry = entry.unwrap();
         let path = entry.path();
         if !path.is_file() {
@@ -151,15 +142,11 @@ fn shrink() {
         let mut img = image::open(path).unwrap().to_rgba();
         fix_translucent(&mut img);
         let img = decode_srgb(&img);
-        assert_eq!(
-            img.dimensions().0,
-            img.dimensions().1,
-            "Image was not square!"
-        );
+        assert_eq!(img.dimensions().0, img.dimensions().1, "Image was not square!");
         assert!(img.dimensions().0 >= 384, "Image dimensions are too small!");
         let img = resize(&img, 192, 192);
         let img = encode_srgb(&img);
-        save(&img, format!("work/shrunk/Block {}", name).as_ref());
+        save(&img, format!("shrunk/Block {}", name).as_ref());
     }
 }
 

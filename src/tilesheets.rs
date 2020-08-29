@@ -10,7 +10,7 @@ use std::{
 };
 
 use image::{self, ImageBuffer, RgbaImage};
-use mediawiki::{tilesheet::Tilesheet, Csrf, Mediawiki, Token};
+use mediawiki::{tilesheet::Tilesheet, Csrf, Mediawiki, Token, Upload};
 use regex::Regex;
 use walkdir::WalkDir;
 
@@ -28,10 +28,7 @@ impl Sheet {
     }
     fn load(data: &[u8], size: u32) -> Sheet {
         let img = image::load_from_memory(data).unwrap();
-        Sheet {
-            size,
-            img: img.to_rgba(),
-        }
+        Sheet { size, img: img.to_rgba() }
     }
     fn grow(&mut self, w: u32, h: u32) {
         let mut img = ImageBuffer::new(w, h);
@@ -97,28 +94,17 @@ impl TilesheetManager {
     }
     fn import_tilesheets(&mut self) {
         println!("Checking for existing tilesheet.");
-        let sheet = self.mw.query_sheets().into_iter().find(|x| {
-            x.as_ref()
-                .ok()
-                .and_then(|x| x.get("mod"))
-                .and_then(|x| x.as_str())
-                .map_or(false, |x| x == self.name)
-        });
+        let sheet = self
+            .mw
+            .query_sheets()
+            .into_iter()
+            .find(|x| x.as_ref().ok().and_then(|x| x.get("mod")).and_then(|x| x.as_str()).map_or(false, |x| x == self.name));
         if let Some(Ok(sheet)) = sheet {
-            let sizes: Vec<u64> = sheet["sizes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|x| x.as_u64().unwrap())
-                .collect();
+            let sizes: Vec<u64> = sheet["sizes"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap()).collect();
             println!("Existing tilesheet sizes: {:?}", sizes);
             println!("Importing existing tilesheet images.");
             for size in sizes {
-                if let Some(data) = self
-                    .mw
-                    .download_file(&format!("Tilesheet {} {}.png", self.name, size))
-                    .unwrap()
-                {
+                if let Some(data) = self.mw.download_file(&format!("Tilesheet {} {}.png", self.name, size)).unwrap() {
                     self.tilesheets.push(Sheet::load(&data, size as u32))
                 } else {
                     println!("WARNING: No tilesheet image found for size {}!", size);
@@ -134,9 +120,7 @@ impl TilesheetManager {
                 self.tilesheets.push(Sheet::new(size.parse().unwrap()));
             }
             let token = self.mw.get_token().unwrap();
-            self.mw
-                .create_sheet(&token, &self.name, &sizes.join("|"))
-                .unwrap();
+            self.mw.create_sheet(&token, &self.name, &sizes.join("|")).unwrap();
         }
     }
     fn import_tiles(&mut self) {
@@ -153,15 +137,14 @@ impl TilesheetManager {
             let y = tile["y"].as_u64().unwrap() as u32;
             let id = tile["id"].as_u64().unwrap();
             let name = tile["name"].as_str().unwrap();
-            self.tiles
-                .insert(name.to_owned(), Tile { x, y, id: Some(id) });
+            self.tiles.insert(name.to_owned(), Tile { x, y, id: Some(id) });
             self.entries.insert((x, y), name.to_owned());
             self.missing.insert(name.to_owned());
         }
     }
     fn check_changes(&mut self) {
         println!("Checking tiles.");
-        let path = Path::new(r"work/tilesheets").join(&self.name);
+        let path = Path::new(r"tilesheets").join(&self.name);
         for entry in WalkDir::new(&path) {
             let entry = entry.unwrap();
             let path = entry.path();
@@ -192,9 +175,9 @@ impl TilesheetManager {
         }
     }
     fn confirm_changes(&mut self) {
-        let mut additions = BufWriter::new(File::create("work/tilesheets/additions.txt").unwrap());
-        let mut missing = BufWriter::new(File::create(r"work/tilesheets/missing.txt").unwrap());
-        let _ = File::create(r"work/tilesheets/todelete.txt").unwrap();
+        let mut additions = BufWriter::new(File::create("tilesheets/additions.txt").unwrap());
+        let mut missing = BufWriter::new(File::create(r"tilesheets/missing.txt").unwrap());
+        let _ = File::create(r"tilesheets/todelete.txt").unwrap();
         for tile in &self.added {
             writeln!(&mut additions, "{}", tile).unwrap();
         }
@@ -216,17 +199,14 @@ impl TilesheetManager {
         }
     }
     fn record_deletions(&mut self) {
-        let todelete = BufReader::new(File::open(r"work/tilesheets/todelete.txt").unwrap());
+        let todelete = BufReader::new(File::open(r"tilesheets/todelete.txt").unwrap());
         for line in todelete.lines() {
             let name = line.unwrap();
             if let Some(tile) = self.tiles.remove(&name) {
                 self.deleted.push(tile.id.unwrap());
                 self.entries.remove(&(tile.x, tile.y));
             } else {
-                println!(
-                    "ERROR: Requested to delete tile that doesn't exist {:?}",
-                    name
-                );
+                println!("ERROR: Requested to delete tile that doesn't exist {:?}", name);
             }
         }
     }
@@ -249,20 +229,13 @@ impl TilesheetManager {
                 self.next.1 = 0;
             }
         };
-        self.tiles.insert(
-            name.to_owned(),
-            Tile {
-                x: pos.0,
-                y: pos.1,
-                id: None,
-            },
-        );
+        self.tiles.insert(name.to_owned(), Tile { x: pos.0, y: pos.1, id: None });
         self.entries.insert(pos, name.to_owned());
         (pos.0, pos.1)
     }
     fn update(&mut self) {
         println!("Updating tilesheet with new tiles.");
-        let path = Path::new(r"work/tilesheets").join(&self.name);
+        let path = Path::new(r"tilesheets").join(&self.name);
         for entry in WalkDir::new(&path) {
             let entry = entry.unwrap();
             let path = entry.path();
@@ -303,7 +276,7 @@ impl TilesheetManager {
             .iter()
             .map(|tilesheet| {
                 let name = format!("Tilesheet {} {}.png", self.name, tilesheet.size);
-                let path = Path::new(r"work/tilesheets").join(name);
+                let path = Path::new(r"tilesheets").join(name);
                 save(&tilesheet.img, &path);
                 temp.push(path.to_owned());
                 Command::new("optipng").arg(path).spawn().unwrap()
@@ -317,91 +290,65 @@ impl TilesheetManager {
     fn upload_sheets(&self) {
         let token = self.mw.get_token().unwrap();
         for path in &self.paths {
-            self.upload_path(path, None, &token, false);
+            let filename = path.file_name().unwrap().to_str().unwrap();
+            self.upload_tilesheet(filename, Upload::File(path.as_path()), &token, false);
         }
     }
-    fn upload_path(
-        &self,
-        path: &PathBuf,
-        filekey: Option<String>,
-        token: &Token<Csrf>,
-        ignore_warnings: bool,
-    ) {
-        let filename = path.file_name().unwrap().to_str().unwrap();
-        if !ignore_warnings {
+    fn upload_tilesheet(&self, filename: &str, file: Upload, token: &Token<Csrf>, ignorewarnings: bool) {
+        //TODO remove once ftb-rs includes z axis and Tilesheet extension is updated
+        let replaced = filename.replace(".png", " 0.png");
+        let filename = if filename.ends_with(" 0.png") { filename } else { replaced.as_str() };
+
+        // If we are ignoring warnings, we already attempted an upload so don't print anything.
+        if !ignorewarnings {
             println!("Uploading \"{}\"", filename);
         }
-        let result;
         let text = "[[Category:Tilesheets]]";
-        if let Some(key) = filekey {
-            result =
-                self.mw
-                    .upload_filekey(filename, key.as_str(), &token, Some(text), ignore_warnings);
-        } else {
-            result = self
-                .mw
-                .upload_file(filename, &path, &token, Some(text), ignore_warnings);
-        }
+        let comment = "Uploaded tilesheet using ftb-rs";
+        let result = self.mw.upload(filename, &token, file, Some(text), Some(comment), ignorewarnings);
 
         if let Ok(v) = result {
+            // print!("{}", v);
             if v.get("errors").is_none() {
-                let value = v.get("upload").unwrap();
-                let response = value.get("result").unwrap().as_str().unwrap();
-                let filekey = &value["filekey"];
-                if response == "Warning" {
-                    let warnings = value.get("warnings").unwrap();
-                    let map = warnings.as_object().unwrap();
-                    let reupload = map
-                        .get("exists")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s == filename)
-                        .unwrap_or(false);
-                    if map.len() == 1 && reupload {
-                        // Warning is about the page already existing, but we are updating it.
-                        self.upload_path(
-                            path,
-                            filekey.as_str().map(|s| s.to_string()),
-                            token,
-                            true,
-                        );
-                        return;
+                let upload = v.get("upload").unwrap();
+                let response = upload.get("result").unwrap().as_str().unwrap();
+                let filekey = &upload["filekey"].as_str();
+                match response {
+                    "Warning" => {
+                        let warnings = &upload["warnings"];
+                        let map = warnings.as_object().unwrap();
+                        let reupload = map.get("exists").and_then(|v| v.as_str()).map(|s| s == filename.replace(" ", "_")).unwrap_or(false);
+                        if map.len() == 1 && reupload {
+                            // Warning is about the page already existing, but we are updating it.
+                            self.upload_tilesheet(filename, Upload::Filekey(filekey.unwrap()), token, true);
+                            return;
+                        }
+                        println!("The API returned warnings when attempting to upload the file.");
+                        println!("Warnings: {}", serde_json::to_string(warnings).unwrap());
+                        println!("Would you like to try to upload the file again and ignore these warnings? y/n");
+                        let mut input = String::new();
+                        stdin().read_line(&mut input).unwrap();
+                        input = input.trim().to_owned();
+                        if input.to_ascii_lowercase() == "y" {
+                            self.upload_tilesheet(filename, Upload::Filekey(filekey.unwrap()), token, true);
+                        } else {
+                            println!("Please manually upload {}", filename);
+                        }
                     }
-                    println!("The API returned warnings when attempting to upload the file.");
-                    println!("Warnings: {:?}", serde_json::to_string(warnings).unwrap());
-                    println!(
-                        "Would you like to try to upload the file again and ignore these warnings? y/n"
-                    );
-                    let mut input = String::new();
-                    stdin().read_line(&mut input).unwrap();
-                    input = input.trim().to_owned();
-                    if input.to_ascii_lowercase() == "y" {
-                        self.upload_path(
-                            path,
-                            filekey.as_str().map(|s| s.to_string()),
-                            token,
-                            true,
-                        );
-                    } else {
-                        println!("Please manually upload {}.", filename);
+                    "Success" => {
+                        println!("Successfully uploaded {}", filename);
                     }
-                } else if response == "Success" {
-                    println!("Successfully uploaded {}", filename);
+                    other => panic!("Unknown result: {}", other),
                 }
             } else {
-                println!(
-                    "An error occurred when uploading \"{}\". Please manually upload the file.",
-                    filename
-                );
+                println!("An error occurred when uploading \"{}\". Please manually upload the file.", filename);
                 let errors = v.get("errors").unwrap().as_array();
-                if let Some(vector) = errors {
+                if let Some(vec) = errors {
                     let mut count = 1;
-                    for error in vector {
+                    for error in vec {
                         let code = error["code"].as_str().unwrap_or("");
                         let description = error["*"].as_str().unwrap_or("");
-                        println!(
-                            "Error response from API ({}): {} - {}",
-                            count, code, description
-                        );
+                        println!("Error response from API ({}): {} - {}", count, code, description);
                         count += 1;
                     }
                 } else {
@@ -409,10 +356,7 @@ impl TilesheetManager {
                 }
             }
         } else {
-            println!(
-                "An error occurred when uploading \"{}\". Please manually upload the file.",
-                filename
-            );
+            println!("An error occurred when uploading \"{}\". Please manually upload the file.", filename);
             println!("Error locally: {:?}", result);
         }
     }
@@ -420,11 +364,7 @@ impl TilesheetManager {
         println!("Deleting old tiles that are no longer needed.");
         let token = self.mw.get_token().unwrap();
         for chunk in self.deleted.chunks(50) {
-            let tiles = chunk
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join("|");
+            let tiles = chunk.iter().map(|id| id.to_string()).collect::<Vec<_>>().join("|");
             if let Err(e) = self.mw.delete_tiles(&token, &tiles) {
                 println!("ERROR: {:?}", e);
             }
@@ -447,10 +387,25 @@ impl TilesheetManager {
             }
         }
     }
+    fn find_sheets(&mut self, path: &Path) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                continue;
+            } else {
+                let regex = Regex::new(format!(r"Tilesheet {} (\d+?)\.png", &self.name).as_str());
+                if regex.unwrap().is_match(path.to_str().unwrap()) {
+                    self.paths.push(path);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn load_renames(name: &str) -> HashMap<String, String> {
-    let path = Path::new(r"work/tilesheets").join(name);
+    let path = Path::new(r"tilesheets").join(name);
     match File::open(&path.join("renames.txt")) {
         Ok(mut file) => {
             let reg = Regex::new("(.*)=(.*)").unwrap();
@@ -475,15 +430,29 @@ fn load_renames(name: &str) -> HashMap<String, String> {
 
 pub fn update_tilesheet(name: &str) {
     let mut manager = TilesheetManager::new(name);
-    manager.import_tilesheets();
-    manager.import_tiles();
-    manager.check_changes();
-    manager.confirm_changes();
-    manager.record_deletions();
-    manager.update();
-    manager.optimize();
-    manager.upload_sheets();
-    manager.delete_tiles();
-    manager.add_tiles();
+    let mut input = String::new();
+    println!("Do you want to attempt ONLY an upload of already-generated tilesheet? y/n");
+    stdin().read_line(&mut input).unwrap();
+    input = input.trim().to_owned();
+    let upload_only = input.to_ascii_lowercase() == "y";
+    if upload_only {
+        let result = manager.find_sheets(Path::new("tilesheets"));
+        if result.is_err() {
+            println!("{}", result.err().unwrap());
+            return;
+        }
+        manager.upload_sheets();
+    } else {
+        manager.import_tilesheets();
+        manager.import_tiles();
+        manager.check_changes();
+        manager.confirm_changes();
+        manager.record_deletions();
+        manager.update();
+        manager.optimize();
+        manager.upload_sheets();
+        manager.delete_tiles();
+        manager.add_tiles();
+    }
     println!("Done");
 }
