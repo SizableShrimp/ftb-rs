@@ -4,7 +4,6 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     io::{stdin, BufRead, BufReader, BufWriter, Read, Write},
-    mem::swap,
     path::{Path, PathBuf},
     process::{exit, Command},
 };
@@ -18,61 +17,79 @@ use crate::{decode_srgb, encode_srgb, fix_translucent, resize, save, FloatImage}
 
 struct Sheet {
     size: u32,
-    img: RgbaImage,
+    layers: Vec<RgbaImage>,
 }
 
 impl Sheet {
     fn new(size: u32) -> Sheet {
-        let img = ImageBuffer::new(size, size);
-        Sheet { size, img }
-    }
-    fn load(data: &[u8], size: u32) -> Sheet {
-        let img = image::load_from_memory(data).unwrap();
-        Sheet { size, img: img.to_rgba() }
-    }
-    fn grow(&mut self, w: u32, h: u32) {
-        let mut img = ImageBuffer::new(w, h);
-        for (x, y, &pix) in self.img.enumerate_pixels() {
-            img.put_pixel(x, y, pix);
+        Sheet {
+            size,
+            layers: Vec::new(),
         }
-        swap(&mut self.img, &mut img);
     }
-    fn insert(&mut self, x: u32, y: u32, img: &FloatImage) {
+    fn load_layer(&mut self, data: &[u8]) {
+        let layer = image::load_from_memory(data).unwrap();
+        self.layers.push(layer.to_rgba());
+    }
+    fn add_layer(&mut self) {
+        let layer = ImageBuffer::new(self.size, self.size);
+        self.layers.push(layer);
+    }
+    fn grow(&mut self, w: u32, h: u32, z: u32) {
+        let mut new_layer = ImageBuffer::new(w, h);
+        let old_layer = &mut self.layers[z as usize];
+        for (x, y, &pix) in old_layer.enumerate_pixels() {
+            new_layer.put_pixel(x, y, pix);
+        }
+        *old_layer = new_layer;
+    }
+    fn insert(&mut self, TilePos { x, y, z }: TilePos, img: &FloatImage) {
         let (width, height) = img.dimensions();
         assert_eq!(width, height);
         let img = resize(img, self.size, self.size);
         let img = encode_srgb(&img);
-        let (w, h) = self.img.dimensions();
-        if (x + 1) * self.size > w || (y + 1) * self.size > h {
+        if z as usize == self.layers.len() {
+            self.add_layer();
+        }
+        let (w, h) = self.layers[z as usize].dimensions();
+        let (nw, nh) = ((x + 1) * self.size, (y + 1) * self.size);
+        if nw > w || nh > h {
             let (nw, nh) = (max((x + 1) * self.size, w), max((y + 1) * self.size, h));
-            self.grow(nw, nh)
+            self.grow(max(w, nw), max(h, nh), z)
         }
         let (x, y) = (x * self.size, y * self.size);
+        let layer = &mut self.layers[z as usize];
         for (xx, yy, &pix) in img.enumerate_pixels() {
-            self.img.put_pixel(x + xx, y + yy, pix);
+            layer.put_pixel(x + xx, y + yy, pix);
         }
     }
 }
 
 #[derive(Debug)]
 struct Tile {
+    pos: TilePos,
+    id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct TilePos {
     x: u32,
     y: u32,
-    id: Option<u64>,
+    z: u32,
 }
 
 struct TilesheetManager {
     mw: Mediawiki,
     name: String,
     tiles: HashMap<String, Tile>,
-    entries: HashMap<(u32, u32), String>,
+    entries: HashMap<TilePos, String>,
     renames: HashMap<String, String>,
     added: Vec<String>,
     missing: HashSet<String>,
     deleted: Vec<u64>,
     tilesheets: Vec<Sheet>,
     paths: Vec<PathBuf>,
-    next: (u32, u32),
+    next: (u32, u32, u32),
 }
 
 impl TilesheetManager {
@@ -89,7 +106,7 @@ impl TilesheetManager {
             deleted: Vec::new(),
             tilesheets: Vec::new(),
             paths: Vec::new(),
-            next: (0, 0),
+            next: (0, 0, 0),
         }
     }
     fn import_tilesheets(&mut self) {
@@ -104,12 +121,22 @@ impl TilesheetManager {
             println!("Existing tilesheet sizes: {:?}", sizes);
             println!("Importing existing tilesheet images.");
             for size in sizes {
-                if let Some(data) = self.mw.download_file(&format!("Tilesheet {} {}.png", self.name, size)).unwrap() {
-                    self.tilesheets.push(Sheet::load(&data, size as u32))
-                } else {
-                    println!("WARNING: No tilesheet image found for size {}!", size);
-                    self.tilesheets.push(Sheet::new(size as u32));
+                let mut sheet = Sheet::new(size as u32);
+                for z in 0.. {
+                    if let Some(data) = self
+                        .mw
+                        .download_file(&format!("Tilesheet {} {} {}.png", self.name, size, z))
+                        .unwrap()
+                    {
+                        sheet.load_layer(&data);
+                    } else {
+                        if z == 0 {
+                            println!("WARNING: No tilesheet image found for size {}!", size);
+                        }
+                        break;
+                    }
                 }
+                self.tilesheets.push(sheet);
             }
         } else {
             println!("No tilesheet found. Please specify desired sizes separated by commas:");
@@ -135,16 +162,18 @@ impl TilesheetManager {
             };
             let x = tile["x"].as_u64().unwrap() as u32;
             let y = tile["y"].as_u64().unwrap() as u32;
+            let z = tile["z"].as_u64().unwrap() as u32;
             let id = tile["id"].as_u64().unwrap();
             let name = tile["name"].as_str().unwrap();
-            self.tiles.insert(name.to_owned(), Tile { x, y, id: Some(id) });
-            self.entries.insert((x, y), name.to_owned());
+            let pos = TilePos { x, y, z };
+            self.tiles.insert(name.to_owned(), Tile { pos, id: Some(id) });
+            self.entries.insert(pos, name.to_owned());
             self.missing.insert(name.to_owned());
         }
     }
     fn check_changes(&mut self) {
         println!("Checking tiles.");
-        let path = Path::new(r"tilesheets").join(&self.name);
+        let path = Path::new(r"work/tilesheets").join(&self.name);
         for entry in WalkDir::new(&path) {
             let entry = entry.unwrap();
             let path = entry.path();
@@ -175,9 +204,9 @@ impl TilesheetManager {
         }
     }
     fn confirm_changes(&mut self) {
-        let mut additions = BufWriter::new(File::create("tilesheets/additions.txt").unwrap());
-        let mut missing = BufWriter::new(File::create(r"tilesheets/missing.txt").unwrap());
-        let _ = File::create(r"tilesheets/todelete.txt").unwrap();
+        let mut additions = BufWriter::new(File::create("work/tilesheets/additions.txt").unwrap());
+        let mut missing = BufWriter::new(File::create(r"work/tilesheets/missing.txt").unwrap());
+        let _ = File::create(r"work/tilesheets/todelete.txt").unwrap();
         for tile in &self.added {
             writeln!(&mut additions, "{}", tile).unwrap();
         }
@@ -199,26 +228,34 @@ impl TilesheetManager {
         }
     }
     fn record_deletions(&mut self) {
-        let todelete = BufReader::new(File::open(r"tilesheets/todelete.txt").unwrap());
+        let todelete = BufReader::new(File::open(r"work/tilesheets/todelete.txt").unwrap());
         for line in todelete.lines() {
             let name = line.unwrap();
             if let Some(tile) = self.tiles.remove(&name) {
                 self.deleted.push(tile.id.unwrap());
-                self.entries.remove(&(tile.x, tile.y));
+                self.entries.remove(&tile.pos);
             } else {
                 println!("ERROR: Requested to delete tile that doesn't exist {:?}", name);
             }
         }
     }
-    fn lookup(&mut self, name: &str) -> (u32, u32) {
+    fn lookup(&mut self, name: &str) -> TilePos {
         if let Some(tile) = self.tiles.get(name) {
-            return (tile.x, tile.y);
+            return tile.pos;
         }
         let pos = loop {
             let pos = if self.next.1 < self.next.0 {
-                (self.next.1, self.next.0)
+                TilePos {
+                    x: self.next.1,
+                    y: self.next.0,
+                    z: self.next.2,
+                }
             } else {
-                (self.next.0, self.next.1 - self.next.0)
+                TilePos {
+                    x: self.next.0,
+                    y: self.next.1 - self.next.0,
+                    z: self.next.2,
+                }
             };
             if self.entries.get(&pos).is_none() {
                 break pos;
@@ -227,15 +264,19 @@ impl TilesheetManager {
             if self.next.1 > self.next.0 * 2 {
                 self.next.0 += 1;
                 self.next.1 = 0;
+                if self.next.0 == 64 {
+                    self.next.0 = 0;
+                    self.next.2 += 1;
+                }
             }
         };
-        self.tiles.insert(name.to_owned(), Tile { x: pos.0, y: pos.1, id: None });
+        self.tiles.insert(name.to_owned(), Tile { pos, id: None });
         self.entries.insert(pos, name.to_owned());
-        (pos.0, pos.1)
+        pos
     }
     fn update(&mut self) {
         println!("Updating tilesheet with new tiles.");
-        let path = Path::new(r"tilesheets").join(&self.name);
+        let path = Path::new(r"work/tilesheets").join(&self.name);
         for entry in WalkDir::new(&path) {
             let entry = entry.unwrap();
             let path = entry.path();
@@ -262,9 +303,9 @@ impl TilesheetManager {
             let mut img = image::open(&path).unwrap().to_rgba();
             fix_translucent(&mut img);
             let img = decode_srgb(&img);
-            let (x, y) = self.lookup(&name);
+            let pos = self.lookup(&name);
             for tilesheet in &mut self.tilesheets {
-                tilesheet.insert(x, y, &img);
+                tilesheet.insert(pos, &img);
             }
         }
     }
@@ -274,12 +315,14 @@ impl TilesheetManager {
         let optipng = self
             .tilesheets
             .iter()
-            .map(|tilesheet| {
-                let name = format!("Tilesheet {} {}.png", self.name, tilesheet.size);
-                let path = Path::new(r"tilesheets").join(name);
-                save(&tilesheet.img, &path);
-                temp.push(path.to_owned());
-                Command::new("optipng").arg(path).spawn().unwrap()
+            .flat_map(|tilesheet| {
+                tilesheet.layers.iter().enumerate().map(move |(z, layer)| {
+                    let name = format!("Tilesheet {} {} {}.png", self.name, tilesheet.size, z);
+                    let path = Path::new(r"work/tilesheets").join(name);
+                    layer.save(&path).unwrap();
+                    temp.push(path.to_owned());
+                    Command::new("optipng").arg(path).spawn().unwrap()
+                })
             })
             .collect::<Vec<_>>();
         self.paths.extend(temp);
@@ -295,10 +338,6 @@ impl TilesheetManager {
         }
     }
     fn upload_tilesheet(&self, filename: &str, file: Upload, token: &Token<Csrf>, ignorewarnings: bool) {
-        //TODO remove once ftb-rs includes z axis and Tilesheet extension is updated
-        let replaced = filename.replace(".png", " 0.png");
-        let filename = if filename.ends_with(" 0.png") { filename } else { replaced.as_str() };
-
         // If we are ignoring warnings, we already attempted an upload so don't print anything.
         if !ignorewarnings {
             println!("Uploading \"{}\"", filename);
@@ -378,7 +417,7 @@ impl TilesheetManager {
                 .iter()
                 .map(|name| {
                     let tile = &self.tiles[name];
-                    format!("{} {} {}", tile.x, tile.y, name)
+                    format!("{} {} {} {}", tile.pos.x, tile.pos.y, tile.pos.z, name)
                 })
                 .collect::<Vec<_>>()
                 .join("|");
@@ -387,25 +426,10 @@ impl TilesheetManager {
             }
         }
     }
-    fn find_sheets(&mut self, path: &Path) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                continue;
-            } else {
-                let regex = Regex::new(format!(r"Tilesheet {} (\d+?)\.png", &self.name).as_str());
-                if regex.unwrap().is_match(path.to_str().unwrap()) {
-                    self.paths.push(path);
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 fn load_renames(name: &str) -> HashMap<String, String> {
-    let path = Path::new(r"tilesheets").join(name);
+    let path = Path::new(r"work/tilesheets").join(name);
     match File::open(&path.join("renames.txt")) {
         Ok(mut file) => {
             let reg = Regex::new("(.*)=(.*)").unwrap();
@@ -430,29 +454,15 @@ fn load_renames(name: &str) -> HashMap<String, String> {
 
 pub fn update_tilesheet(name: &str) {
     let mut manager = TilesheetManager::new(name);
-    let mut input = String::new();
-    println!("Do you want to attempt ONLY an upload of already-generated tilesheet? y/n");
-    stdin().read_line(&mut input).unwrap();
-    input = input.trim().to_owned();
-    let upload_only = input.to_ascii_lowercase() == "y";
-    if upload_only {
-        let result = manager.find_sheets(Path::new("tilesheets"));
-        if result.is_err() {
-            println!("{}", result.err().unwrap());
-            return;
-        }
-        manager.upload_sheets();
-    } else {
-        manager.import_tilesheets();
-        manager.import_tiles();
-        manager.check_changes();
-        manager.confirm_changes();
-        manager.record_deletions();
-        manager.update();
-        manager.optimize();
-        manager.upload_sheets();
-        manager.delete_tiles();
-        manager.add_tiles();
-    }
+    manager.import_tilesheets();
+    manager.import_tiles();
+    manager.check_changes();
+    manager.confirm_changes();
+    manager.record_deletions();
+    manager.update();
+    manager.optimize();
+    manager.upload_sheets();
+    manager.delete_tiles();
+    manager.add_tiles();
     println!("Done");
 }
