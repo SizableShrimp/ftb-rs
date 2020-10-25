@@ -13,7 +13,7 @@ use mediawiki::{tilesheet::Tilesheet, Csrf, Mediawiki, Token, Upload};
 use regex::Regex;
 use walkdir::WalkDir;
 
-use crate::{decode_srgb, encode_srgb, fix_translucent, resize, save, FloatImage};
+use crate::{decode_srgb, encode_srgb, fix_translucent, resize, FloatImage};
 
 struct Sheet {
     size: u32,
@@ -22,10 +22,7 @@ struct Sheet {
 
 impl Sheet {
     fn new(size: u32) -> Sheet {
-        Sheet {
-            size,
-            layers: Vec::new(),
-        }
+        Sheet { size, layers: Vec::new() }
     }
     fn load_layer(&mut self, data: &[u8]) {
         let layer = image::load_from_memory(data).unwrap();
@@ -123,11 +120,7 @@ impl TilesheetManager {
             for size in sizes {
                 let mut sheet = Sheet::new(size as u32);
                 for z in 0.. {
-                    if let Some(data) = self
-                        .mw
-                        .download_file(&format!("Tilesheet {} {} {}.png", self.name, size, z))
-                        .unwrap()
-                    {
+                    if let Some(data) = self.mw.download_file(&format!("Tilesheet {} {} {}.png", self.name, size, z)).unwrap() {
                         sheet.load_layer(&data);
                     } else {
                         if z == 0 {
@@ -311,23 +304,23 @@ impl TilesheetManager {
     }
     fn optimize(&mut self) {
         println!("Optimizing tilesheets");
-        let mut temp = Vec::new();
-        let optipng = self
+        let paths: Vec<_> = self
             .tilesheets
             .iter()
             .flat_map(|tilesheet| {
+                let name = &self.name[..];
                 tilesheet.layers.iter().enumerate().map(move |(z, layer)| {
-                    let name = format!("Tilesheet {} {} {}.png", self.name, tilesheet.size, z);
+                    let name = format!("Tilesheet {} {} {}.png", name, tilesheet.size, z);
                     let path = Path::new(r"work/tilesheets").join(name);
                     layer.save(&path).unwrap();
-                    temp.push(path.to_owned());
-                    Command::new("optipng").arg(path).spawn().unwrap()
+                    // &self.paths.push(path.to_owned());
+                    path
                 })
             })
-            .collect::<Vec<_>>();
-        self.paths.extend(temp);
-        for mut child in optipng {
-            child.wait().unwrap();
+            .collect();
+        self.paths.extend(paths);
+        for path in &self.paths {
+            Command::new("optipng").arg(path).spawn().unwrap().wait().unwrap();
         }
     }
     fn upload_sheets(&self) {
